@@ -1,0 +1,119 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: Clarklevis1995/dsh-plugin-mobile-gateway
+      SYNC_BRANCH: main
+      WORKFLOW_PATH: .github/workflows/sync-upstream.yml
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Stash this workflow
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sync"
+          cp "$WORKFLOW_PATH" "$RUNNER_TEMP/sync/sync-upstream.yml"
+
+      - name: Configure git
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          if git fetch upstream --prune --tags --force; then
+            git rev-parse "upstream/${SYNC_BRANCH}" > "$RUNNER_TEMP/up_sha"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=$(cat "$RUNNER_TEMP/up_sha")" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游仓库无法访问，可能已删除或转为私有"
+          fi
+
+      - name: Align default branch with upstream
+        if: steps.fetch.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UP_SHA="$(cat "$RUNNER_TEMP/up_sha")"
+          CUR_SHA="$(git rev-parse "origin/${SYNC_BRANCH}")"
+          echo "upstream = ${UP_SHA}"
+          echo "fork     = ${CUR_SHA}"
+          if [ "$UP_SHA" = "$CUR_SHA" ]; then
+            echo "结论：完全一致，无需改动"
+            exit 0
+          fi
+          if [ "$(git rev-parse "${CUR_SHA}^" 2>/dev/null || echo none)" = "$UP_SHA" ]; then
+            echo "结论：fork 仅比上游多一个同步提交，已是最新"
+            exit 0
+          fi
+          git checkout -B "${SYNC_BRANCH}" "$UP_SHA"
+          if git cat-file -e "HEAD:${WORKFLOW_PATH}" 2>/dev/null; then
+            # 上游自带同名文件：推送后本仓库的同步 workflow 会被覆盖、定时同步将停止。
+            # 必须在推送前把这事喊出来，否则就静默失效了。
+            echo "::error::上游开始自带 ${WORKFLOW_PATH}，推送后同步 workflow 会被覆盖"
+            TITLE="上游新增了同名同步 workflow：${WORKFLOW_PATH}"
+            if gh issue list --state open --search "$TITLE in:title" --json title --jq '.[].title' | grep -Fxq "$TITLE"; then
+              echo "已有同名 issue，跳过重复告警"
+            else
+              gh issue create \
+                --title "$TITLE" \
+                --body "上游 ${UPSTREAM_REPO} 现在自带 ${WORKFLOW_PATH}。为避免与上游内容冲突，自动同步会保留上游版本，本仓库的定时同步可能因此停止。请人工检查并调整（改同步 workflow 的文件名，或改用 NAS 定时推送）。"
+            fi
+          else
+            mkdir -p "$(dirname "$WORKFLOW_PATH")"
+            cp "$RUNNER_TEMP/sync/sync-upstream.yml" "$WORKFLOW_PATH"
+            git add "$WORKFLOW_PATH"
+            # [skip ci] 阻止这次 force push 触发上游自带的 push 型 workflow
+            git commit -m "chore: keep upstream sync workflow [skip ci]"
+          fi
+          git push --force origin "${SYNC_BRANCH}"
+          echo "结论：已强制对齐到 ${UP_SHA}"
+
+      - name: Mirror tags
+        if: steps.fetch.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          git push --force --tags origin
+          echo "tag 已推送，当前数量：$(git tag --list | wc -l)"
+
+      - name: Warn when upstream is gone
+        if: steps.fetch.outputs.ok != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="上游仓库不可访问：${UPSTREAM_REPO}"
+          if gh issue list --state open --search "$TITLE in:title" --json title --jq '.[].title' | grep -Fxq "$TITLE"; then
+            echo "已有未关闭的同名 issue，跳过重复告警"
+            exit 0
+          fi
+          gh issue create \
+            --title "$TITLE" \
+            --body "自动同步在 $(date -u +%Y-%m-%dT%H:%M:%SZ) 拉取上游失败。可能原因：上游被删除、转为私有，或改名。当前 fork 保留最后一次成功同步的完整快照，仍可正常使用。"
+          echo "::error::上游不可访问，已在本仓库开 issue 告警"
+          exit 1
